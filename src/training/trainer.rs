@@ -1,11 +1,13 @@
 use candle_core::{DType, Device, Result, Tensor};
 use candle_nn::optim::{AdamW, Optimizer, ParamsAdamW};
 use candle_nn::VarMap;
+use std::collections::HashMap;
 
 use crate::data::entity_tracking::{EntityTrackingGenerator, TrainingExample, Vocabulary};
 use crate::eval::recall_curve::RecallTracker;
 use crate::model::world_state_model::{WorldStateModel, WorldStateModelConfig};
 use crate::training::loss;
+use crate::training::loss::DynamicAlpha;
 
 pub struct TrainerConfig {
     pub learning_rate: f64,
@@ -42,6 +44,8 @@ pub struct Trainer {
     config: TrainerConfig,
     device: Device,
     recall_tracker: RecallTracker,
+    dynamic_alpha: DynamicAlpha,
+    quiz_type_stats: HashMap<String, (usize, usize)>,
 }
 
 impl Trainer {
@@ -54,6 +58,7 @@ impl Trainer {
         let vb = candle_nn::VarBuilder::from_varmap(&varmap, DType::F32, &device);
 
         let mut vocab = Vocabulary::new();
+        let base_alpha = model_config.quiz_alpha;
 
         let actual_config = WorldStateModelConfig {
             ssm: crate::model::ssm::SsmConfig {
@@ -80,6 +85,7 @@ impl Trainer {
 
         let data_gen = EntityTrackingGenerator::new(trainer_config.seed);
         let recall_tracker = RecallTracker::new();
+        let dynamic_alpha = DynamicAlpha::new(base_alpha);
 
         Ok(Self {
             model,
@@ -90,11 +96,13 @@ impl Trainer {
             config: trainer_config,
             device,
             recall_tracker,
+            dynamic_alpha,
+            quiz_type_stats: HashMap::new(),
         })
     }
 
     pub fn train(&mut self) -> Result<()> {
-        println!("=== Understanding Pressure Training ===");
+        println!("=== Understanding Pressure v0.2.0 (Refined) ===");
         println!("Device: {:?}", self.device);
         println!("Vocab size: {}", self.vocab.size());
         println!(
@@ -104,7 +112,12 @@ impl Trainer {
             self.model.config().ssm.d_inner,
             self.model.config().ssm.n_layers,
         );
-        println!("Quiz alpha: {}", self.model.config().quiz_alpha);
+        println!(
+            "Quiz alpha: dynamic (base={})",
+            self.model.config().quiz_alpha
+        );
+        println!("Quiz types: Location, ObjectHolder, Contradiction, TemporalDelta, MultiHop");
+        println!("Quiz head: attention-pooled over layer states");
         println!(
             "Epochs: {}, Examples/epoch: {}",
             self.config.epochs, self.config.examples_per_epoch
@@ -131,8 +144,16 @@ impl Trainer {
                         quiz_count += stats.num_quizzes;
                         total_examples += 1;
 
-                        for (distance, correct) in &stats.quiz_results {
+                        for (distance, correct, quiz_type_name) in &stats.quiz_results {
                             self.recall_tracker.record(*distance, *correct);
+                            let entry = self
+                                .quiz_type_stats
+                                .entry(quiz_type_name.clone())
+                                .or_insert((0, 0));
+                            entry.0 += 1;
+                            if *correct {
+                                entry.1 += 1;
+                            }
                         }
                     }
                     Err(e) => {
@@ -155,15 +176,18 @@ impl Trainer {
                 };
 
                 if epoch % self.config.log_interval == 0 || epoch == self.config.epochs - 1 {
+                    let alpha = self.dynamic_alpha.get_alpha();
                     println!(
-                        "Epoch {}/{}: lm_loss={:.4}, quiz_loss={:.4}, quiz_acc={:.2}%, quizzes={}",
+                        "Epoch {}/{}: lm_loss={:.4}, quiz_loss={:.4}, quiz_acc={:.2}%, α={:.3}, quizzes={}",
                         epoch + 1,
                         self.config.epochs,
                         avg_lm,
                         avg_quiz,
                         avg_acc * 100.0,
+                        alpha,
                         quiz_count,
                     );
+                    self.print_quiz_type_stats();
                 }
 
                 if epoch % self.config.eval_interval == 0 || epoch == self.config.epochs - 1 {
@@ -180,13 +204,12 @@ impl Trainer {
     fn train_example(&mut self, example: &TrainingExample) -> Result<ExampleStats> {
         let batch_size = 1;
         let mut states = self.model.init_states(batch_size, &self.device)?;
-        let quiz_alpha = self.model.config().quiz_alpha;
 
         let mut total_lm_loss = 0.0;
         let mut total_quiz_loss = 0.0;
         let mut total_quiz_acc = 0.0;
         let mut num_quizzes = 0;
-        let mut quiz_results: Vec<(usize, bool)> = Vec::new();
+        let mut quiz_results: Vec<(usize, bool, String)> = Vec::new();
 
         let quizzes_by_chunk: std::collections::HashMap<
             usize,
@@ -232,7 +255,10 @@ impl Trainer {
 
                     let quiz_logits = self.model.quiz(&states, &q_emb_mean)?;
 
-                    let answer_tensor = Tensor::new(&[quiz.answer_idx as u32], &self.device)?
+                    let num_model_answers = quiz_logits.dims()[1];
+                    let effective_answer = quiz.answer_idx.min(num_model_answers - 1);
+
+                    let answer_tensor = Tensor::new(&[effective_answer as u32], &self.device)?
                         .to_dtype(DType::U32)?;
 
                     let q_loss = loss::quiz_loss(&quiz_logits, &answer_tensor)?;
@@ -244,9 +270,13 @@ impl Trainer {
                     num_quizzes += 1;
 
                     let correct = q_acc > 0.5;
-                    quiz_results.push((quiz.distance, correct));
+                    let type_name = format!("{:?}", quiz.quiz_type);
+                    quiz_results.push((quiz.distance, correct, type_name));
 
-                    let combined = (&lm_loss + &(q_loss * quiz_alpha)?)?;
+                    self.dynamic_alpha.update(lm_loss_val, q_loss_val);
+                    let alpha = self.dynamic_alpha.get_alpha();
+
+                    let combined = (&lm_loss + &(q_loss * alpha)?)?;
                     self.optimizer.backward_step(&combined)?;
                 }
             } else {
@@ -280,6 +310,24 @@ impl Trainer {
             padded.resize(target_len, 0);
             padded
         }
+    }
+
+    fn print_quiz_type_stats(&self) {
+        if self.quiz_type_stats.is_empty() {
+            return;
+        }
+        let mut types: Vec<_> = self.quiz_type_stats.iter().collect();
+        types.sort_by_key(|(name, _)| name.clone());
+        print!("  Per-type accuracy: ");
+        for (name, (total, correct)) in &types {
+            let acc = if *total > 0 {
+                *correct as f64 / *total as f64
+            } else {
+                0.0
+            };
+            print!("{}={:.0}%({}) ", name, acc * 100.0, total);
+        }
+        println!();
     }
 
     fn print_recall_curve(&self) {
@@ -334,6 +382,10 @@ impl Trainer {
                 println!("  ✗ Significant context rot - architecture may need changes");
             }
         }
+
+        println!("\n--- Per Quiz-Type Performance ---");
+        self.print_quiz_type_stats();
+        println!("\n  Final α: {:.3}", self.dynamic_alpha.get_alpha());
     }
 
     pub fn save(&self, path: &str) -> Result<()> {
@@ -348,5 +400,5 @@ struct ExampleStats {
     quiz_loss: f64,
     quiz_accuracy: f64,
     num_quizzes: usize,
-    quiz_results: Vec<(usize, bool)>,
+    quiz_results: Vec<(usize, bool, String)>,
 }

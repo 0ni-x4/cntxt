@@ -48,8 +48,9 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     println!("╔══════════════════════════════════════════════════╗");
-    println!("║       Understanding Pressure v0.1.0             ║");
+    println!("║       Understanding Pressure v0.2.0             ║");
     println!("║  Training SSMs to UNDERSTAND, not just predict  ║");
+    println!("║  Refined: 5 quiz types + attention + dynamic α  ║");
     println!("╚══════════════════════════════════════════════════╝");
     println!();
 

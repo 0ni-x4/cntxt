@@ -66,8 +66,9 @@ impl SelectiveScanLayer {
         let z = z.silu()?;
 
         let delta = self.proj_delta.forward(&z)?;
-        let delta = delta.clamp(-20.0, 20.0)?;
+        let delta = delta.clamp(-10.0, 10.0)?;
         let delta = (delta.exp()? + 1.0)?.log()?;
+        let delta = delta.clamp(0.001, 5.0)?;
 
         let b = self.proj_b.forward(&z)?;
         let c = self.proj_c.forward(&z)?;
@@ -101,6 +102,7 @@ impl SelectiveScanLayer {
             let input_contrib = z_expanded.mul(&b_expanded)?.mul(&delta_expanded)?;
 
             state = (state_decayed + input_contrib)?;
+            state = state.clamp(-50.0, 50.0)?;
 
             let y_t = (&state
                 * &c_t

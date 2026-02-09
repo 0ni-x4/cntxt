@@ -55,10 +55,11 @@ impl WorldStateModel {
         )?;
         let lm_head = linear(config.ssm.d_model, config.ssm.vocab_size, vb.pp("lm_head"))?;
 
-        let d_state_total = config.ssm.d_inner * config.ssm.d_state * config.ssm.n_layers;
+        let d_state_per_layer = config.ssm.d_inner * config.ssm.d_state;
         let quiz_head = QuizHead::new(
-            d_state_total,
+            d_state_per_layer,
             config.ssm.d_model,
+            config.ssm.n_layers,
             config.num_quiz_answers,
             vb.pp("quiz_head"),
         )?;
@@ -87,23 +88,11 @@ impl WorldStateModel {
     }
 
     pub fn quiz(&self, states: &[Tensor], question_emb: &Tensor) -> Result<Tensor> {
-        let flat_state = self.flatten_states(states)?;
-        self.quiz_head.forward(&flat_state, question_emb)
+        self.quiz_head.forward(states, question_emb)
     }
 
     pub fn embed_tokens(&self, token_ids: &Tensor) -> Result<Tensor> {
         self.token_emb.forward(token_ids)
-    }
-
-    fn flatten_states(&self, states: &[Tensor]) -> Result<Tensor> {
-        let flattened: Vec<Tensor> = states
-            .iter()
-            .map(|s| {
-                let (batch, d_inner, d_state) = s.dims3().unwrap();
-                s.reshape((batch, d_inner * d_state)).unwrap()
-            })
-            .collect();
-        Tensor::cat(&flattened, 1)
     }
 
     pub fn init_states(&self, batch_size: usize, device: &Device) -> Result<Vec<Tensor>> {

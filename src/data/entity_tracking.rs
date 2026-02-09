@@ -16,26 +16,53 @@ const OBJECTS: &[&str] = &[
     "key", "book", "phone", "letter", "map", "ring", "coin", "hat", "bag", "card",
 ];
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum QuizType {
+    EntityLocation,
+    ObjectHolder,
+    Contradiction,
+    TemporalDelta,
+    MultiHop,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Quiz {
     pub question_tokens: Vec<u32>,
     pub answer_idx: usize,
     pub quiz_type: QuizType,
     pub distance: usize,
+    pub num_answers: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum QuizType {
-    EntityLocation,
-    ObjectHolder,
-    StateTracking,
-    Contradiction,
+#[derive(Debug, Clone)]
+struct WorldSnapshot {
+    entity_locations: HashMap<String, String>,
+    entity_objects: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct TransferEvent {
+    object: String,
+    #[allow(dead_code)]
+    from_entity: String,
+    to_entity: String,
+    chunk_idx: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainingExample {
     pub chunks: Vec<Vec<u32>>,
     pub quizzes: Vec<(usize, Quiz)>,
+}
+
+impl TrainingExample {
+    pub fn max_quiz_answers(&self) -> usize {
+        self.quizzes
+            .iter()
+            .map(|(_, q)| q.num_answers)
+            .max()
+            .unwrap_or(16)
+    }
 }
 
 pub struct Vocabulary {
@@ -68,7 +95,8 @@ impl Vocabulary {
             "put", "down", "gave", "took", "from", "and", "then", "after", "that", "later", "next",
             "while", "before", "has", "had", "was", "with", "where", "what", "who", "holds",
             "carrying", "left", "dropped", "found", "lost", "happy", "sad", "alive", "not", "dead",
-            "said", "told", "asked", "knows", "thinks", "believes", "saw",
+            "said", "told", "asked", "knows", "thinks", "believes", "saw", "still", "changed",
+            "no", "yes", "since", "between", "now", "chunk", "waited",
         ];
         for w in &filler_words {
             vocab.add_word(w);
@@ -156,6 +184,14 @@ impl EntityTrackingGenerator {
                 .push(OBJECTS[i].to_string());
         }
 
+        let mut snapshots: Vec<WorldSnapshot> = Vec::with_capacity(num_chunks + 1);
+        let mut transfer_events: Vec<TransferEvent> = Vec::new();
+
+        snapshots.push(WorldSnapshot {
+            entity_locations: entity_locations.clone(),
+            entity_objects: entity_objects.clone(),
+        });
+
         let mut chunks = Vec::with_capacity(num_chunks);
         let mut quizzes = Vec::new();
 
@@ -211,6 +247,12 @@ impl EntityTrackingGenerator {
                                 let obj_idx = self.rng.gen_range(0..entity_objects[entity].len());
                                 let obj = entity_objects.get_mut(entity).unwrap().remove(obj_idx);
                                 entity_objects.get_mut(other).unwrap().push(obj.clone());
+                                transfer_events.push(TransferEvent {
+                                    object: obj.clone(),
+                                    from_entity: entity.to_string(),
+                                    to_entity: other.to_string(),
+                                    chunk_idx,
+                                });
                                 format!("{} gave the {} to {}", entity, obj, other)
                             } else {
                                 let loc = &entity_locations[entity];
@@ -229,56 +271,323 @@ impl EntityTrackingGenerator {
             let chunk_tokens = vocab.encode(&chunk_text);
             chunks.push(chunk_tokens);
 
-            if chunk_idx > 0 && self.rng.gen_bool(0.7) {
-                let quiz_entity = names[self.rng.gen_range(0..names.len())];
-                let quiz_type = if self.rng.gen_bool(0.6) {
-                    QuizType::EntityLocation
-                } else {
-                    QuizType::ObjectHolder
-                };
+            snapshots.push(WorldSnapshot {
+                entity_locations: entity_locations.clone(),
+                entity_objects: entity_objects.clone(),
+            });
+        }
 
-                match quiz_type {
-                    QuizType::EntityLocation => {
-                        let question = format!("where is {}", quiz_entity);
-                        let question_tokens = vocab.encode(&question);
-                        let correct_loc = &entity_locations[quiz_entity];
-                        let answer_idx =
-                            LOCATIONS.iter().position(|l| l == correct_loc).unwrap_or(0);
-                        quizzes.push((
-                            chunk_idx,
-                            Quiz {
-                                question_tokens,
-                                answer_idx,
-                                quiz_type: QuizType::EntityLocation,
-                                distance: chunk_idx,
-                            },
-                        ));
-                    }
-                    QuizType::ObjectHolder => {
-                        let objs = &entity_objects[quiz_entity];
-                        if !objs.is_empty() {
-                            let obj = &objs[0];
-                            let question = format!("who holds the {}", obj);
-                            let question_tokens = vocab.encode(&question);
-                            let answer_idx =
-                                names.iter().position(|n| *n == quiz_entity).unwrap_or(0);
-                            quizzes.push((
-                                chunk_idx,
-                                Quiz {
-                                    question_tokens,
-                                    answer_idx,
-                                    quiz_type: QuizType::ObjectHolder,
-                                    distance: chunk_idx,
-                                },
-                            ));
-                        }
-                    }
-                    _ => {}
-                }
+        self.schedule_quizzes(
+            vocab,
+            &names,
+            &entity_locations,
+            &entity_objects,
+            &snapshots,
+            &transfer_events,
+            num_chunks,
+            &mut quizzes,
+        );
+
+        TrainingExample { chunks, quizzes }
+    }
+
+    fn schedule_quizzes(
+        &mut self,
+        vocab: &mut Vocabulary,
+        names: &[&str],
+        current_locations: &HashMap<String, String>,
+        current_objects: &HashMap<String, Vec<String>>,
+        snapshots: &[WorldSnapshot],
+        transfer_events: &[TransferEvent],
+        num_chunks: usize,
+        quizzes: &mut Vec<(usize, Quiz)>,
+    ) {
+        let target_distances: Vec<usize> = vec![1, 2, 3, 5, 7]
+            .into_iter()
+            .filter(|d| *d < num_chunks)
+            .collect();
+
+        for &target_dist in &target_distances {
+            let chunk_idx = if target_dist < num_chunks {
+                target_dist
+            } else {
+                num_chunks - 1
+            };
+            if chunk_idx == 0 {
+                continue;
+            }
+
+            let quiz_types = self.available_quiz_types(
+                names,
+                current_objects,
+                snapshots,
+                transfer_events,
+                chunk_idx,
+            );
+
+            if quiz_types.is_empty() {
+                continue;
+            }
+
+            let qt_idx = self.rng.gen_range(0..quiz_types.len());
+            let qt = quiz_types[qt_idx].clone();
+
+            if let Some(quiz) = self.generate_quiz(
+                vocab,
+                &qt,
+                names,
+                current_locations,
+                current_objects,
+                snapshots,
+                transfer_events,
+                chunk_idx,
+                target_dist,
+            ) {
+                quizzes.push((chunk_idx, quiz));
             }
         }
 
-        TrainingExample { chunks, quizzes }
+        for chunk_idx in 1..num_chunks {
+            if quizzes.iter().any(|(ci, _)| *ci == chunk_idx) {
+                continue;
+            }
+            if !self.rng.gen_bool(0.5) {
+                continue;
+            }
+
+            let distance = chunk_idx;
+            let qt = if self.rng.gen_bool(0.6) {
+                QuizType::EntityLocation
+            } else {
+                QuizType::ObjectHolder
+            };
+
+            if let Some(quiz) = self.generate_quiz(
+                vocab,
+                &qt,
+                names,
+                current_locations,
+                current_objects,
+                snapshots,
+                transfer_events,
+                chunk_idx,
+                distance,
+            ) {
+                quizzes.push((chunk_idx, quiz));
+            }
+        }
+    }
+
+    fn available_quiz_types(
+        &self,
+        names: &[&str],
+        current_objects: &HashMap<String, Vec<String>>,
+        snapshots: &[WorldSnapshot],
+        transfer_events: &[TransferEvent],
+        chunk_idx: usize,
+    ) -> Vec<QuizType> {
+        let mut types = vec![QuizType::EntityLocation];
+
+        let has_objects = current_objects.values().any(|v| !v.is_empty());
+        if has_objects {
+            types.push(QuizType::ObjectHolder);
+        }
+
+        if chunk_idx >= 2 && snapshots.len() > chunk_idx {
+            let earlier_idx = if chunk_idx > 3 { chunk_idx - 3 } else { 0 };
+            let earlier = &snapshots[earlier_idx];
+            let current = &snapshots[chunk_idx];
+            let has_contradiction = names.iter().any(|name| {
+                earlier.entity_locations.get(*name) != current.entity_locations.get(*name)
+            });
+            if has_contradiction {
+                types.push(QuizType::Contradiction);
+            }
+        }
+
+        if chunk_idx >= 2 && snapshots.len() > chunk_idx {
+            let earlier_idx = if chunk_idx > 3 { chunk_idx - 3 } else { 0 };
+            let earlier = &snapshots[earlier_idx];
+            let current = &snapshots[chunk_idx];
+            let has_delta = names.iter().any(|name| {
+                earlier.entity_locations.get(*name) != current.entity_locations.get(*name)
+            });
+            if has_delta {
+                types.push(QuizType::TemporalDelta);
+            }
+        }
+
+        let relevant_transfers: Vec<&TransferEvent> = transfer_events
+            .iter()
+            .filter(|t| t.chunk_idx < chunk_idx)
+            .collect();
+        if !relevant_transfers.is_empty() {
+            types.push(QuizType::MultiHop);
+        }
+
+        types
+    }
+
+    fn generate_quiz(
+        &mut self,
+        vocab: &mut Vocabulary,
+        quiz_type: &QuizType,
+        names: &[&str],
+        current_locations: &HashMap<String, String>,
+        current_objects: &HashMap<String, Vec<String>>,
+        snapshots: &[WorldSnapshot],
+        transfer_events: &[TransferEvent],
+        chunk_idx: usize,
+        distance: usize,
+    ) -> Option<Quiz> {
+        match quiz_type {
+            QuizType::EntityLocation => {
+                let entity = names[self.rng.gen_range(0..names.len())];
+                let question = format!("where is {}", entity);
+                let question_tokens = vocab.encode(&question);
+                let correct_loc = current_locations.get(entity)?;
+                let answer_idx = LOCATIONS.iter().position(|l| l == correct_loc)?;
+                Some(Quiz {
+                    question_tokens,
+                    answer_idx,
+                    quiz_type: QuizType::EntityLocation,
+                    distance,
+                    num_answers: LOCATIONS.len(),
+                })
+            }
+            QuizType::ObjectHolder => {
+                let holders: Vec<&&str> = names
+                    .iter()
+                    .filter(|n| {
+                        current_objects
+                            .get(**n)
+                            .map(|v| !v.is_empty())
+                            .unwrap_or(false)
+                    })
+                    .collect();
+                if holders.is_empty() {
+                    return None;
+                }
+                let holder = holders[self.rng.gen_range(0..holders.len())];
+                let objs = current_objects.get(*holder)?;
+                let obj = &objs[self.rng.gen_range(0..objs.len())];
+                let question = format!("who holds the {}", obj);
+                let question_tokens = vocab.encode(&question);
+                let answer_idx = names.iter().position(|n| n == holder)?;
+                Some(Quiz {
+                    question_tokens,
+                    answer_idx,
+                    quiz_type: QuizType::ObjectHolder,
+                    distance,
+                    num_answers: names.len(),
+                })
+            }
+            QuizType::Contradiction => {
+                if snapshots.len() <= chunk_idx {
+                    return None;
+                }
+                let earlier_idx = if chunk_idx > 3 { chunk_idx - 3 } else { 0 };
+                let earlier = &snapshots[earlier_idx];
+                let current = &snapshots[chunk_idx];
+
+                let moved_entities: Vec<&&str> = names
+                    .iter()
+                    .filter(|name| {
+                        earlier.entity_locations.get(**name) != current.entity_locations.get(**name)
+                    })
+                    .collect();
+
+                if moved_entities.is_empty() {
+                    return None;
+                }
+
+                let entity = moved_entities[self.rng.gen_range(0..moved_entities.len())];
+
+                let use_old_location = self.rng.gen_bool(0.5);
+                if use_old_location {
+                    let old_loc = earlier.entity_locations.get(*entity)?;
+                    let question = format!("is {} still in the {}", entity, old_loc);
+                    let question_tokens = vocab.encode(&question);
+                    Some(Quiz {
+                        question_tokens,
+                        answer_idx: 0,
+                        quiz_type: QuizType::Contradiction,
+                        distance,
+                        num_answers: 2,
+                    })
+                } else {
+                    let new_loc = current.entity_locations.get(*entity)?;
+                    let question = format!("is {} still in the {}", entity, new_loc);
+                    let question_tokens = vocab.encode(&question);
+                    Some(Quiz {
+                        question_tokens,
+                        answer_idx: 1,
+                        quiz_type: QuizType::Contradiction,
+                        distance,
+                        num_answers: 2,
+                    })
+                }
+            }
+            QuizType::TemporalDelta => {
+                if snapshots.len() <= chunk_idx {
+                    return None;
+                }
+                let earlier_idx = if chunk_idx > 3 { chunk_idx - 3 } else { 0 };
+                let earlier = &snapshots[earlier_idx];
+                let current = &snapshots[chunk_idx];
+
+                let changed_entities: Vec<(usize, &&str)> = names
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, name)| {
+                        earlier.entity_locations.get(**name) != current.entity_locations.get(**name)
+                    })
+                    .collect();
+
+                if changed_entities.is_empty() {
+                    return None;
+                }
+
+                let (answer_idx, _entity) =
+                    changed_entities[self.rng.gen_range(0..changed_entities.len())];
+                let question = format!("who changed since chunk {}", earlier_idx);
+                let question_tokens = vocab.encode(&question);
+                Some(Quiz {
+                    question_tokens,
+                    answer_idx,
+                    quiz_type: QuizType::TemporalDelta,
+                    distance,
+                    num_answers: names.len(),
+                })
+            }
+            QuizType::MultiHop => {
+                let relevant: Vec<&TransferEvent> = transfer_events
+                    .iter()
+                    .filter(|t| t.chunk_idx < chunk_idx)
+                    .collect();
+
+                if relevant.is_empty() {
+                    return None;
+                }
+
+                let transfer = relevant[self.rng.gen_range(0..relevant.len())];
+
+                let holder = &transfer.to_entity;
+                let holder_loc = current_locations.get(holder.as_str())?;
+
+                let question = format!("where is the {}", transfer.object);
+                let question_tokens = vocab.encode(&question);
+                let answer_idx = LOCATIONS.iter().position(|l| *l == holder_loc.as_str())?;
+
+                Some(Quiz {
+                    question_tokens,
+                    answer_idx,
+                    quiz_type: QuizType::MultiHop,
+                    distance,
+                    num_answers: LOCATIONS.len(),
+                })
+            }
+        }
     }
 
     pub fn generate_batch(
@@ -327,6 +636,85 @@ mod tests {
         for (chunk_idx, quiz) in &example.quizzes {
             assert!(*chunk_idx > 0);
             assert!(!quiz.question_tokens.is_empty());
+            assert!(quiz.num_answers >= 2);
         }
+    }
+
+    #[test]
+    fn test_quiz_type_diversity() {
+        let mut vocab = Vocabulary::new();
+        let mut gen = EntityTrackingGenerator::new(123);
+        let mut found_types: Vec<QuizType> = Vec::new();
+        for _ in 0..50 {
+            let example = gen.generate(&mut vocab, 10);
+            for (_, quiz) in &example.quizzes {
+                if !found_types.iter().any(|t| *t == quiz.quiz_type) {
+                    found_types.push(quiz.quiz_type.clone());
+                }
+            }
+        }
+        assert!(
+            found_types.len() >= 3,
+            "should generate at least 3 quiz types across 50 examples, got: {:?}",
+            found_types
+        );
+    }
+
+    #[test]
+    fn test_scheduled_distances() {
+        let mut vocab = Vocabulary::new();
+        let mut gen = EntityTrackingGenerator::new(999);
+        let mut all_distances: Vec<usize> = Vec::new();
+        for _ in 0..20 {
+            let example = gen.generate(&mut vocab, 10);
+            for (_, quiz) in &example.quizzes {
+                all_distances.push(quiz.distance);
+            }
+        }
+        assert!(
+            all_distances.iter().any(|d| *d >= 3),
+            "should have quizzes at distance >= 3"
+        );
+    }
+
+    #[test]
+    fn test_contradiction_quiz() {
+        let mut vocab = Vocabulary::new();
+        let mut gen = EntityTrackingGenerator::new(777);
+        let mut found_contradiction = false;
+        for _ in 0..100 {
+            let example = gen.generate(&mut vocab, 10);
+            for (_, quiz) in &example.quizzes {
+                if quiz.quiz_type == QuizType::Contradiction {
+                    assert_eq!(quiz.num_answers, 2);
+                    assert!(quiz.answer_idx <= 1);
+                    found_contradiction = true;
+                }
+            }
+        }
+        assert!(
+            found_contradiction,
+            "should find at least one contradiction quiz in 100 examples"
+        );
+    }
+
+    #[test]
+    fn test_multihop_quiz() {
+        let mut vocab = Vocabulary::new();
+        let mut gen = EntityTrackingGenerator::new(555);
+        let mut found_multihop = false;
+        for _ in 0..100 {
+            let example = gen.generate(&mut vocab, 10);
+            for (_, quiz) in &example.quizzes {
+                if quiz.quiz_type == QuizType::MultiHop {
+                    assert_eq!(quiz.num_answers, LOCATIONS.len());
+                    found_multihop = true;
+                }
+            }
+        }
+        assert!(
+            found_multihop,
+            "should find at least one multi-hop quiz in 100 examples"
+        );
     }
 }
