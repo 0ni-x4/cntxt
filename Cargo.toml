@@ -1,0 +1,19 @@
+[package]
+name = "understanding-pressure"
+version = "0.1.0"
+edition = "2021"
+description = "Understanding Pressure: Training SSMs to build world models via comprehension-forcing objectives"
+
+[dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+rand = "0.8"
+rand_chacha = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
