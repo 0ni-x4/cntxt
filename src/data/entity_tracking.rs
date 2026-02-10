@@ -278,12 +278,17 @@ impl EntityTrackingGenerator {
                                 ];
                                 transfer_templates[self.rng.gen_range(0..transfer_templates.len())].clone()
                             } else {
-                                let loc = &entity_locations[entity];
-                                let see_templates = [
-                                    format!("{} saw {} in the {}", entity, other, loc),
-                                    format!("{} met {} in the {}", entity, other, loc),
-                                    format!("{} was with {} in the {}", entity, other, loc),
-                                ];
+                                let entity_loc = &entity_locations[entity];
+                                let other_loc = &entity_locations[other];
+                                let see_templates: Vec<String> = if entity_loc == other_loc {
+                                    vec![
+                                        format!("{} saw {} in the {}", entity, other, entity_loc),
+                                        format!("{} met {} in the {}", entity, other, entity_loc),
+                                        format!("{} was with {} in the {}", entity, other, entity_loc),
+                                    ]
+                                } else {
+                                    vec![format!("{} saw {} in the {}", entity, other, other_loc)]
+                                };
                                 see_templates[self.rng.gen_range(0..see_templates.len())].clone()
                             }
                         } else {
